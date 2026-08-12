@@ -11,6 +11,18 @@ const W = 480, H = 720;
 const LEVEL_UP_SECONDS = 15; // このタイム毎にレベルアップ
 const CLEAR_LEVEL = 60;      // このレベルの監視者を打ち破るとクリア（上位層のみ到達可能な難関ライン）
 
+// Lv30までの難易度カーブは適正という判断のもと、以降の伸びだけを半分の速度に落とすための
+// 「難易度計算用レベル」。ring/aim/各ギミックの強さ(弾速以外の頻度・弾数・拡散角など)は
+// 実レベルではなくこの値を使って算出する。ギミックの解禁タイミング(GIMMICK_BANDS)は
+// コンテンツ構成そのものなので実レベルのまま変更しない。Lv60は現行のLv45相当の強さになる。
+const DIFFICULTY_RAMP_SOFTEN_FROM = 30;
+const DIFFICULTY_RAMP_SOFTEN_RATE = 0.5;
+function rampLevel(level) {
+  return level <= DIFFICULTY_RAMP_SOFTEN_FROM
+    ? level
+    : DIFFICULTY_RAMP_SOFTEN_FROM + (level - DIFFICULTY_RAMP_SOFTEN_FROM) * DIFFICULTY_RAMP_SOFTEN_RATE;
+}
+
 // 称号システム：到達レベル帯ごとの称号（クリアラインLv.60に合わせて再設計）
 const TITLES = [
   { min: 0,  max: 5,  name: '迷い込んだ者',     color: '#6a6780' },
@@ -493,17 +505,21 @@ export default function AbyssalWatcher() {
   // 難易度は発射頻度・弾数・way数・追加パターンの解禁テンポだけで作る。
   function diffForLevel(level) {
     const SPAWN_K = 0.0035, SPAWN_P = 1.6; // Lv60でもspawnRateMul=4.0程度に収まる、さらに緩やかなカーブ
+    // Lv30以降は体感で難しすぎるとの判断のため、強さの算出は実レベルではなくrampLevel(30まではそのまま、
+    // それ以降は半分の速度でしか伸びない)を用いる。ギミックの解禁自体(breatherBonusの帯判定など)は
+    // コンテンツ構成なので実レベルのまま。
+    const rl = rampLevel(level);
     // Lv27-32(fan+homing+dash帯)はLv20-26(flower+laser帯)に比べ弾密度が大きく落ち込みやすいバランス上の弱点があったため、
     // この帯だけring/aimの基礎値を底上げして「難易度の谷」を緩和する(難易度カーブ監査 2026-08-12 所見1)
     const breatherBonus = (level >= 27 && level <= 32) ? 1 : 0;
     return {
       bulletSpeedMul: 1, // 固定：レベルによって弾速は変化しない
-      spawnRateMul: 1 + SPAWN_K * Math.pow(level - 1, SPAWN_P),     // 発射間隔を短くする係数として使用(逆数)
-      ringCount: Math.min(24, 7 + Math.floor(level * 0.29)) + breatherBonus * 5, // 24発到達をLv60間際まで先送り(所見3)
-      aimSpread: Math.min(0.3, 0.14 + level * 0.0027),
-      aimWays: Math.min(6, 2 + Math.floor(level / 14)) + breatherBonus,          // 6way到達をLv60間際まで先送り(所見3)
-      homingChance: clamp((level - 20) * 0.02, 0, 0.6), // 解禁(Lv27)時点で既にある程度の脅威になるよう早めに立ち上げる(所見2)
-      colorPhase: Math.min(3, 1 + Math.floor((level - 1) / 20)) // 色/世界観の変化(20レベル毎、Lv60までに3段階)
+      spawnRateMul: 1 + SPAWN_K * Math.pow(rl - 1, SPAWN_P),     // 発射間隔を短くする係数として使用(逆数)
+      ringCount: Math.min(24, 7 + Math.floor(rl * 0.29)) + breatherBonus * 5, // 24発到達をLv60間際まで先送り(所見3)
+      aimSpread: Math.min(0.3, 0.14 + rl * 0.0027),
+      aimWays: Math.min(6, 2 + Math.floor(rl / 14)) + breatherBonus,          // 6way到達をLv60間際まで先送り(所見3)
+      homingChance: clamp((rl - 20) * 0.02, 0, 0.6), // 解禁(Lv27)時点で既にある程度の脅威になるよう早めに立ち上げる(所見2)
+      colorPhase: Math.min(3, 1 + Math.floor((level - 1) / 20)) // 色/世界観の変化は実レベル基準のまま(演出上の進行感を保つ)
     };
   }
 
@@ -558,6 +574,7 @@ export default function AbyssalWatcher() {
   function runPatterns(st) {
     const boss = st.boss;
     const diff = diffForLevel(st.level);
+    const rl = rampLevel(st.level); // 各パターンの強さの算出は実レベルではなくこちらを使う(Lv30以降は伸びを半減)
     const t = boss.levelT;
     const gimmicks = activeGimmicks(st.level); // このレベル帯でアクティブな追加ギミック(入れ替え制)
     // 弾を撒くギミックが同時に何個アクティブかに応じて、以降の全パターンの間隔を延ばす負荷補正。
@@ -597,7 +614,7 @@ export default function AbyssalWatcher() {
     if (gimmicks.includes('spiral')) {
       const spiralInterval = Math.max(9, Math.round(14 / diff.spawnRateMul * loadComp));
       if (t % spiralInterval === 0) {
-        const rot = t * (0.09 + st.level * 0.0015);
+        const rot = t * (0.09 + rl * 0.0015);
         [0, Math.PI].forEach(off => {
           const ang = rot + off;
           const spd = 2.6 * diff.bulletSpeedMul;
@@ -614,7 +631,7 @@ export default function AbyssalWatcher() {
       const wallInterval = Math.max(80, Math.round(150 / diff.spawnRateMul * loadComp));
       if (t % wallInterval === 0 && !hasActiveHorizontalLaser(st)) {
         const gapY = rand(H * 0.25, H * 0.75);
-        const gapSize = Math.max(110, 170 - st.level);
+        const gapSize = Math.max(110, 170 - rl);
         const spd = 3.4 * diff.bulletSpeedMul;
         for (let y = 20; y < H - 20; y += 26) {
           if (Math.abs(y - gapY) < gapSize / 2) continue;
@@ -629,7 +646,7 @@ export default function AbyssalWatcher() {
     if (gimmicks.includes('flower')) {
       const flowerInterval = Math.max(10, Math.round(15 / diff.spawnRateMul * loadComp));
       if (t % flowerInterval === 0) {
-        const arms = Math.min(5, 3 + Math.floor(st.level / 22));
+        const arms = Math.min(5, 3 + Math.floor(rl / 22));
         const rot = t * 0.045;
         const spd = 2.3 * diff.bulletSpeedMul;
         for (let i = 0; i < arms; i++) {
@@ -645,7 +662,7 @@ export default function AbyssalWatcher() {
     if (gimmicks.includes('homing')) {
       const homingInterval = Math.max(50, Math.round(90 / diff.spawnRateMul * loadComp));
       if (t % homingInterval === 0 && Math.random() < Math.max(0.35, diff.homingChance)) {
-        const n = st.level >= 45 ? 3 : 2;
+        const n = rl >= 45 ? 3 : 2;
         for (let i = 0; i < n; i++) {
           spawnBullet(st, {
             x: boss.x + rand(-40, 40), y: boss.y, vx: rand(-0.5, 0.5), vy: 1.2,
@@ -662,7 +679,7 @@ export default function AbyssalWatcher() {
       if (t % fanInterval === 0) {
         const dx = st.player.x - boss.x, dy = st.player.y - boss.y;
         const base = Math.atan2(dy, dx);
-        const fanN = Math.min(9, 5 + Math.floor(st.level / 15));
+        const fanN = Math.min(9, 5 + Math.floor(rl / 15));
         const fanWidth = Math.PI * 0.55;
         const spd = 2.5 * diff.bulletSpeedMul;
         for (let i = 0; i < fanN; i++) {
@@ -713,7 +730,7 @@ export default function AbyssalWatcher() {
     // forceVertical: 壁弾が飛行中の場合はY軸競合を避けるため縦方向に固定する
     const vertical = forceVertical || Math.random() < 0.5;
     const gapPos = vertical ? rand(W * 0.2, W * 0.8) : rand(H * 0.3, H * 0.7);
-    const gapSize = Math.max(60, 100 - st.level);
+    const gapSize = Math.max(60, 100 - rampLevel(st.level));
     st.lasers.push({
       vertical, gapPos, gapSize,
       telegraphT: 55,   // 予告表示フレーム数（この間は当たらない）
@@ -835,7 +852,7 @@ export default function AbyssalWatcher() {
       boss.x = rand(W * 0.25, W * 0.75);
       boss.y = rand(90, 220);
     } else {
-      const moveSpeed = 0.02 + Math.min(0.05, st.level * 0.0018);
+      const moveSpeed = 0.02 + Math.min(0.05, rampLevel(st.level) * 0.0018);
       boss.x = W / 2 + Math.sin(boss.globalT * moveSpeed) * (W * 0.28);
       boss.y = 130 + Math.sin(boss.globalT * moveSpeed * 0.6) * 22;
     }
