@@ -596,15 +596,18 @@ export default function AbyssalWatcher() {
     }
 
     // 壁弾（このレベル帯でアクティブな場合のみ、隙間を広く・間隔を延長）
+    // wallとlaser(横方向)はどちらも「安全なY座標」を独立した乱数で決めるため、両方が同時にアクティブだと
+    // 安全帯が噛み合わず回避不可能な瞬間が生じうる(難易度カーブ監査フォローアップで実測: 該当帯の約85%のランで発生)。
+    // 横方向laserが予告・発射中は壁弾の発生を見送ることで、この組み合わせ事故を構造的に防ぐ。
     if (gimmicks.includes('wall')) {
       const wallInterval = Math.max(80, Math.round(150 / diff.spawnRateMul));
-      if (t % wallInterval === 0) {
+      if (t % wallInterval === 0 && !hasActiveHorizontalLaser(st)) {
         const gapY = rand(H * 0.25, H * 0.75);
         const gapSize = Math.max(110, 170 - st.level);
         const spd = 3.4 * diff.bulletSpeedMul;
         for (let y = 20; y < H - 20; y += 26) {
           if (Math.abs(y - gapY) < gapSize / 2) continue;
-          spawnBullet(st, { x: -10, y, vx: spd, vy: 0, r: 5, color: colorFor(diff, 'wall') });
+          spawnBullet(st, { x: -10, y, vx: spd, vy: 0, r: 5, color: colorFor(diff, 'wall'), wallBullet: true });
         }
       }
     }
@@ -659,10 +662,11 @@ export default function AbyssalWatcher() {
     }
 
     // レーザー予告→発射（このレベル帯でアクティブな場合のみ）：間隔を延長、隙間を広く
+    // 壁弾が画面上に飛んでいる間は、横方向(Y軸で競合しうる)ではなく縦方向に固定して衝突事故を防ぐ
     if (gimmicks.includes('laser')) {
       const laserInterval = Math.max(220, Math.round(320 / diff.spawnRateMul));
       if (t % laserInterval === 0) {
-        spawnLaser(st);
+        spawnLaser(st, hasWallBulletsInFlight(st));
       }
     }
 
@@ -683,10 +687,20 @@ export default function AbyssalWatcher() {
     }
   }
 
-  function spawnLaser(st) {
+  // 壁弾が画面上に飛んでいるか（wall/laser同時発生時の安全帯衝突を避けるための判定）
+  function hasWallBulletsInFlight(st) {
+    return st.bullets.some(b => b.wallBullet);
+  }
+  // 横方向のレーザーが予告中または発射中か（同上）
+  function hasActiveHorizontalLaser(st) {
+    return st.lasers.some(l => !l.vertical && (l.telegraphT > 0 || l.activeT > 0));
+  }
+
+  function spawnLaser(st, forceVertical) {
     const boss = st.boss;
     // 縦・横どちらかランダムに、狭い隙間を持つレーザー予告→発射
-    const vertical = Math.random() < 0.5;
+    // forceVertical: 壁弾が飛行中の場合はY軸競合を避けるため縦方向に固定する
+    const vertical = forceVertical || Math.random() < 0.5;
     const gapPos = vertical ? rand(W * 0.2, W * 0.8) : rand(H * 0.3, H * 0.7);
     const gapSize = Math.max(60, 100 - st.level);
     st.lasers.push({
