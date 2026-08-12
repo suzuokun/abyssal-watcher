@@ -4,3 +4,4 @@ dist-ssr
 *.local
 preview.log
 npm-debug.log*
+preview*.log
