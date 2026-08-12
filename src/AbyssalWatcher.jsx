@@ -493,13 +493,16 @@ export default function AbyssalWatcher() {
   // 難易度は発射頻度・弾数・way数・追加パターンの解禁テンポだけで作る。
   function diffForLevel(level) {
     const SPAWN_K = 0.0035, SPAWN_P = 1.6; // Lv60でもspawnRateMul=4.0程度に収まる、さらに緩やかなカーブ
+    // Lv27-32(fan+homing+dash帯)はLv20-26(flower+laser帯)に比べ弾密度が大きく落ち込みやすいバランス上の弱点があったため、
+    // この帯だけring/aimの基礎値を底上げして「難易度の谷」を緩和する(難易度カーブ監査 2026-08-12 所見1)
+    const breatherBonus = (level >= 27 && level <= 32) ? 1 : 0;
     return {
       bulletSpeedMul: 1, // 固定：レベルによって弾速は変化しない
       spawnRateMul: 1 + SPAWN_K * Math.pow(level - 1, SPAWN_P),     // 発射間隔を短くする係数として使用(逆数)
-      ringCount: Math.min(24, 7 + Math.floor(level * 0.35)),         // 24発到達はLv50付近
-      aimSpread: Math.min(0.3, 0.14 + level * 0.003),
-      aimWays: Math.min(6, 2 + Math.floor(level / 12)),               // 6way到達はLv50付近
-      homingChance: clamp((level - 27) * 0.025, 0, 0.5),
+      ringCount: Math.min(24, 7 + Math.floor(level * 0.29)) + breatherBonus * 5, // 24発到達をLv60間際まで先送り(所見3)
+      aimSpread: Math.min(0.3, 0.14 + level * 0.0027),
+      aimWays: Math.min(6, 2 + Math.floor(level / 14)) + breatherBonus,          // 6way到達をLv60間際まで先送り(所見3)
+      homingChance: clamp((level - 20) * 0.02, 0, 0.6), // 解禁(Lv27)時点で既にある程度の脅威になるよう早めに立ち上げる(所見2)
       colorPhase: Math.min(3, 1 + Math.floor((level - 1) / 20)) // 色/世界観の変化(20レベル毎、Lv60までに3段階)
     };
   }
@@ -512,7 +515,7 @@ export default function AbyssalWatcher() {
     { min: 8,  max: 13, set: ['spiral'] },
     { min: 14, max: 19, set: ['wall', 'fan'] },
     { min: 20, max: 26, set: ['flower', 'laser'] },
-    { min: 27, max: 32, set: ['homing', 'dash'] },
+    { min: 27, max: 32, set: ['fan', 'homing', 'dash'] }, // 難易度カーブ監査 所見1: fanを復帰させ谷を底上げ
     { min: 33, max: 39, set: ['teleport', 'spiral'] },
     { min: 40, max: 49, set: ['wall', 'laser', 'dash'] },
     { min: 50, max: 59, set: ['flower', 'homing', 'teleport'] },
@@ -607,10 +610,12 @@ export default function AbyssalWatcher() {
     }
 
     // 花状弾幕（このレベル帯でアクティブな場合のみ、腕数を抑え間隔を延長）
+    // 解禁直後(Lv20)にほぼ最速間隔へ達してしまい急激な難易度スパイクになっていたため、
+    // 間隔の下限と腕数の増加ペースを緩め、Lv20〜59にかけてより長くランプアップするよう調整(難易度カーブ監査 所見1,3)
     if (gimmicks.includes('flower')) {
-      const flowerInterval = Math.max(6, Math.round(9 / diff.spawnRateMul));
+      const flowerInterval = Math.max(9, Math.round(14 / diff.spawnRateMul));
       if (t % flowerInterval === 0) {
-        const arms = Math.min(7, 4 + Math.floor(st.level / 20));
+        const arms = Math.min(6, 3 + Math.floor(st.level / 18));
         const rot = t * 0.045;
         const spd = 2.3 * diff.bulletSpeedMul;
         for (let i = 0; i < arms; i++) {
@@ -620,19 +625,26 @@ export default function AbyssalWatcher() {
       }
     }
 
-    // 誘導弾（このレベル帯でアクティブな場合のみ、発生率をさらに抑える）
-    if (gimmicks.includes('homing') && t % 150 === 0 && Math.random() < diff.homingChance * 0.5) {
-      for (let i = 0; i < 2; i++) {
-        spawnBullet(st, {
-          x: boss.x + rand(-40, 40), y: boss.y, vx: rand(-0.5, 0.5), vy: 1.2,
-          r: 6, color: colorFor(diff, 'homing'), homing: true, spd: 1.4 * diff.bulletSpeedMul
-        });
+    // 誘導弾（このレベル帯でアクティブな場合のみ）
+    // 旧式は150フレームに1回・homingChance×0.5でしか判定せず、上限でも期待値0.2発/秒と
+    // ほぼ無音のギミックになっていたため、判定間隔を短縮し発動率に下限を設けて実際に脅威になるよう強化(所見2)
+    if (gimmicks.includes('homing')) {
+      const homingInterval = Math.max(50, Math.round(90 / diff.spawnRateMul));
+      if (t % homingInterval === 0 && Math.random() < Math.max(0.35, diff.homingChance)) {
+        const n = st.level >= 45 ? 3 : 2;
+        for (let i = 0; i < n; i++) {
+          spawnBullet(st, {
+            x: boss.x + rand(-40, 40), y: boss.y, vx: rand(-0.5, 0.5), vy: 1.2,
+            r: 6, color: colorFor(diff, 'homing'), homing: true, spd: 1.4 * diff.bulletSpeedMul
+          });
+        }
       }
     }
 
     // 扇状バースト（このレベル帯でアクティブな場合のみ）：本数を抑え間隔を延長
+    // Lv27-32帯の底上げに再登板させたため、間隔の下限をわずかに縮めて存在感を持たせる(所見1)
     if (gimmicks.includes('fan')) {
-      const fanInterval = Math.max(90, Math.round(160 / diff.spawnRateMul));
+      const fanInterval = Math.max(70, Math.round(160 / diff.spawnRateMul));
       if (t % fanInterval === 0) {
         const dx = st.player.x - boss.x, dy = st.player.y - boss.y;
         const base = Math.atan2(dy, dx);
