@@ -526,6 +526,12 @@ export default function AbyssalWatcher() {
     return band.set;
   }
 
+  // 実際に弾を撒くギミック(laser/dash/teleportは弾を生成しない別種の脅威なので対象外)。
+  // ring/aimなどの基礎パターンはギミックが何個重なっても一切減らず単純加算されてしまい、
+  // 終盤(特にLv60の全ギミック同時解放)で画面上の同時弾数が理論値で500発超に達し実質詰みうる状態だったため、
+  // 同時発生中の弾ギミック数に応じて全パターンの間隔を延ばす「負荷補正」を導入する(2026-08-12 追加検証)
+  const BULLET_GIMMICKS = ['spiral', 'wall', 'flower', 'fan', 'homing'];
+
   /* ---------------- 初期状態生成 ---------------- */
   function freshState() {
     return {
@@ -554,9 +560,14 @@ export default function AbyssalWatcher() {
     const diff = diffForLevel(st.level);
     const t = boss.levelT;
     const gimmicks = activeGimmicks(st.level); // このレベル帯でアクティブな追加ギミック(入れ替え制)
+    // 弾を撒くギミックが同時に何個アクティブかに応じて、以降の全パターンの間隔を延ばす負荷補正。
+    // ring/aim等の基礎パターンは元々ギミック数に関係なく一定量発射されるため、ギミックが積み上がるほど
+    // 単純加算で画面が埋まってしまう問題があった(Lv60で理論上の同時弾数が500発を超えていた)。
+    const activeBulletGimmickCount = gimmicks.filter(g => BULLET_GIMMICKS.includes(g)).length;
+    const loadComp = 1 + activeBulletGimmickCount * 0.35;
 
     // リング弾（弾数・頻度を大幅に抑えた基礎パターン）
-    const ringInterval = Math.max(24, Math.round(70 / diff.spawnRateMul));
+    const ringInterval = Math.max(24, Math.round(70 / diff.spawnRateMul * loadComp));
     if (t % ringInterval === 0) {
       const n = diff.ringCount;
       const rot = (t / ringInterval) * 0.25;
@@ -568,7 +579,7 @@ export default function AbyssalWatcher() {
     }
 
     // 自機狙い（way数・拡散角がレベルで緩やかに増加）
-    const aimInterval = Math.max(26, Math.round(48 / diff.spawnRateMul));
+    const aimInterval = Math.max(26, Math.round(48 / diff.spawnRateMul * loadComp));
     if (t % aimInterval === 0) {
       const dx = st.player.x - boss.x, dy = st.player.y - boss.y;
       const base = Math.atan2(dy, dx);
@@ -584,7 +595,7 @@ export default function AbyssalWatcher() {
 
     // 螺旋（このレベル帯でアクティブな場合のみ、間隔を大幅に延長）
     if (gimmicks.includes('spiral')) {
-      const spiralInterval = Math.max(9, Math.round(14 / diff.spawnRateMul));
+      const spiralInterval = Math.max(9, Math.round(14 / diff.spawnRateMul * loadComp));
       if (t % spiralInterval === 0) {
         const rot = t * (0.09 + st.level * 0.0015);
         [0, Math.PI].forEach(off => {
@@ -600,7 +611,7 @@ export default function AbyssalWatcher() {
     // 安全帯が噛み合わず回避不可能な瞬間が生じうる(難易度カーブ監査フォローアップで実測: 該当帯の約85%のランで発生)。
     // 横方向laserが予告・発射中は壁弾の発生を見送ることで、この組み合わせ事故を構造的に防ぐ。
     if (gimmicks.includes('wall')) {
-      const wallInterval = Math.max(80, Math.round(150 / diff.spawnRateMul));
+      const wallInterval = Math.max(80, Math.round(150 / diff.spawnRateMul * loadComp));
       if (t % wallInterval === 0 && !hasActiveHorizontalLaser(st)) {
         const gapY = rand(H * 0.25, H * 0.75);
         const gapSize = Math.max(110, 170 - st.level);
@@ -616,9 +627,9 @@ export default function AbyssalWatcher() {
     // 解禁直後(Lv20)にほぼ最速間隔へ達してしまい急激な難易度スパイクになっていたため、
     // 間隔の下限と腕数の増加ペースを緩め、Lv20〜59にかけてより長くランプアップするよう調整(難易度カーブ監査 所見1,3)
     if (gimmicks.includes('flower')) {
-      const flowerInterval = Math.max(9, Math.round(14 / diff.spawnRateMul));
+      const flowerInterval = Math.max(10, Math.round(15 / diff.spawnRateMul * loadComp));
       if (t % flowerInterval === 0) {
-        const arms = Math.min(6, 3 + Math.floor(st.level / 18));
+        const arms = Math.min(5, 3 + Math.floor(st.level / 22));
         const rot = t * 0.045;
         const spd = 2.3 * diff.bulletSpeedMul;
         for (let i = 0; i < arms; i++) {
@@ -632,7 +643,7 @@ export default function AbyssalWatcher() {
     // 旧式は150フレームに1回・homingChance×0.5でしか判定せず、上限でも期待値0.2発/秒と
     // ほぼ無音のギミックになっていたため、判定間隔を短縮し発動率に下限を設けて実際に脅威になるよう強化(所見2)
     if (gimmicks.includes('homing')) {
-      const homingInterval = Math.max(50, Math.round(90 / diff.spawnRateMul));
+      const homingInterval = Math.max(50, Math.round(90 / diff.spawnRateMul * loadComp));
       if (t % homingInterval === 0 && Math.random() < Math.max(0.35, diff.homingChance)) {
         const n = st.level >= 45 ? 3 : 2;
         for (let i = 0; i < n; i++) {
@@ -647,7 +658,7 @@ export default function AbyssalWatcher() {
     // 扇状バースト（このレベル帯でアクティブな場合のみ）：本数を抑え間隔を延長
     // Lv27-32帯の底上げに再登板させたため、間隔の下限をわずかに縮めて存在感を持たせる(所見1)
     if (gimmicks.includes('fan')) {
-      const fanInterval = Math.max(70, Math.round(160 / diff.spawnRateMul));
+      const fanInterval = Math.max(70, Math.round(160 / diff.spawnRateMul * loadComp));
       if (t % fanInterval === 0) {
         const dx = st.player.x - boss.x, dy = st.player.y - boss.y;
         const base = Math.atan2(dy, dx);
