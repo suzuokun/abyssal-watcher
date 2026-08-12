@@ -1,4 +1,6 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
+import { db } from './firebase.js';
+import { collection, addDoc, getDocs, query, orderBy, limit } from 'firebase/firestore';
 
 /* =========================================================
    深淵絶界 -ABYSSAL WATCHER- (レベル無限昇格版)
@@ -1230,30 +1232,26 @@ export default function AbyssalWatcher() {
 
   // 起動時：この端末に保存されたプレイヤーデータを読み込む(個人用・非共有)
   useEffect(() => {
-    (async () => {
-      try {
-        const res = await window.storage.get('playerData', false);
-        if (res && res.value) {
-          const parsed = JSON.parse(res.value);
-          setLocalStats(s => ({
-            attempts: parsed.attempts || 0,
-            bestLevel: parsed.bestLevel || 0,
-            bestTime: parsed.bestTime || 0,
-            cleared: !!parsed.cleared,
-            history: Array.isArray(parsed.history) ? parsed.history : []
-          }));
-        }
-      } catch (_) { /* 初回起動など、データがなければ何もしない */ }
-      localStatsLoadedRef.current = true;
-    })();
+    try {
+      const raw = localStorage.getItem('aw_playerData');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        setLocalStats(s => ({
+          attempts: parsed.attempts || 0,
+          bestLevel: parsed.bestLevel || 0,
+          bestTime: parsed.bestTime || 0,
+          cleared: !!parsed.cleared,
+          history: Array.isArray(parsed.history) ? parsed.history : []
+        }));
+      }
+    } catch (_) { /* 初回起動など、データがなければ何もしない */ }
+    localStatsLoadedRef.current = true;
   }, []);
 
   // localStatsが変化するたびに端末へ保存(読み込み完了後のみ、初期状態での上書きを防ぐ)
   useEffect(() => {
     if (!localStatsLoadedRef.current) return;
-    (async () => {
-      try { await window.storage.set('playerData', JSON.stringify(localStats), false); } catch (_) { /* 保存失敗は致命的でないため無視 */ }
-    })();
+    try { localStorage.setItem('aw_playerData', JSON.stringify(localStats)); } catch (_) { /* 保存失敗は致命的でないため無視 */ }
   }, [localStats]);
 
   /* ---------------- 入力ハンドラ ---------------- */
@@ -1307,24 +1305,11 @@ export default function AbyssalWatcher() {
   const loadRanking = useCallback(async (scope) => {
     setRankingLoading(true);
     try {
-      const list = await window.storage.list('score_', true);
-      if (!list || !list.keys || list.keys.length === 0) {
-        rankingCacheRef.current = [];
-        setRanking([]);
-        setGlobalStats(null);
-        setRankingLoading(false);
-        return;
-      }
-      const entries = [];
-      for (const key of list.keys) {
-        try {
-          const res = await window.storage.get(key, true);
-          if (res && res.value) {
-            const parsed = JSON.parse(res.value);
-            entries.push(parsed);
-          }
-        } catch (_) { /* skip broken entry */ }
-      }
+      // クリア済み優先・タイム/レベルでの厳密な並びはクライアント側(applyRankingScope)で行うため、
+      // ここでは直近の送信順に十分な件数を取得するだけでよい。
+      const q = query(collection(db, 'scores'), orderBy('ts', 'desc'), limit(500));
+      const snap = await getDocs(q);
+      const entries = snap.docs.map(d => d.data());
       rankingCacheRef.current = entries;
       applyRankingScope(scope || rankingScope, entries);
       setGlobalStats(computeGlobalStats(entries)); // 全期間・全レコードを対象に集計(週間フィルタは適用しない)
@@ -1388,7 +1373,6 @@ export default function AbyssalWatcher() {
     setSubmitErrorMsg('');
 
     const entry = { name, level: result.level, time: Number(result.time.toFixed(2)), graze: result.graze, cleared: !!result.cleared, ts: Date.now() };
-    const key = `score_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
     // モバイル回線など不安定な通信環境を想定し、間隔を空けながら複数回試行する
     const RETRY_DELAYS_MS = [0, 800, 2000]; // 即時 → 0.8秒後 → 2秒後
@@ -1397,27 +1381,21 @@ export default function AbyssalWatcher() {
     for (let i = 0; i < RETRY_DELAYS_MS.length; i++) {
       if (RETRY_DELAYS_MS[i] > 0) await new Promise(r => setTimeout(r, RETRY_DELAYS_MS[i]));
       try {
-        await window.storage.set(key, JSON.stringify(entry), true);
+        await addDoc(collection(db, 'scores'), entry);
         setSubmitState('done');
         loadRanking(rankingScope);
         return;
       } catch (e) {
         lastError = e;
-        // 保存自体は実は成功していて、レスポンス解析だけ失敗しているケースを拾う
-        try {
-          const list = await window.storage.list('score_', true);
-          if (list && list.keys && list.keys.includes(key)) {
-            setSubmitState('done');
-            loadRanking(rankingScope);
-            return;
-          }
-        } catch (_) { /* list確認も失敗した場合は次のリトライへ */ }
       }
     }
 
-    // 全リトライが失敗：通信環境が原因の可能性を案内しつつ、個人用ストレージへのフォールバックを試す
+    // 全リトライが失敗：通信環境が原因の可能性を案内しつつ、この端末にだけ記録を残す
     try {
-      await window.storage.set(key, JSON.stringify(entry), false);
+      const localKey = 'aw_local_fallback_scores';
+      const existing = JSON.parse(localStorage.getItem(localKey) || '[]');
+      existing.push(entry);
+      localStorage.setItem(localKey, JSON.stringify(existing));
       setSubmitState('localFallback');
       return;
     } catch (_) { /* 個人保存も失敗した場合は下のunavailable表示に委ねる */ }
@@ -1438,24 +1416,9 @@ export default function AbyssalWatcher() {
   const loadHallOfFame = useCallback(async () => {
     setHallLoading(true);
     try {
-      const list = await window.storage.list('score_', true);
-      if (!list || !list.keys || list.keys.length === 0) {
-        setHallOfFame([]);
-        setHallLoading(false);
-        return;
-      }
-      const entries = [];
-      for (const key of list.keys) {
-        try {
-          const res = await window.storage.get(key, true);
-          if (res && res.value) {
-            const parsed = JSON.parse(res.value);
-            if (parsed.cleared) entries.push(parsed);
-          }
-        } catch (_) { /* skip broken entry */ }
-      }
-      // 討伐日時の新しい順
-      entries.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      const q = query(collection(db, 'scores'), orderBy('ts', 'desc'), limit(500));
+      const snap = await getDocs(q);
+      const entries = snap.docs.map(d => d.data()).filter(e => e.cleared);
       setHallOfFame(entries.slice(0, 100));
     } catch (e) {
       setHallOfFame([]);
