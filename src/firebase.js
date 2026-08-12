@@ -1,5 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import { getFirestore } from 'firebase/firestore';
+import { getAuth } from 'firebase/auth';
 
 // Firebaseコンソール > プロジェクト設定 > 全般 > マイアプリ に表示される値をここへ貼り付ける。
 // これは公開クライアント向けの識別情報であり秘密鍵ではないため、リポジトリに含めてよい。
@@ -15,3 +16,4 @@ const firebaseConfig = {
 
 export const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app);
+export const auth = getAuth(app);

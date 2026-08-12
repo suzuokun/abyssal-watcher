@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { db } from './firebase.js';
-import { collection, addDoc, getDocs, query, orderBy, limit } from 'firebase/firestore';
+import { db, auth } from './firebase.js';
+import { collection, addDoc, getDocs, query, orderBy, limit, deleteDoc, doc } from 'firebase/firestore';
+import { signInWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
 
 /* =========================================================
    深淵絶界 -ABYSSAL WATCHER- (レベル無限昇格版)
@@ -50,6 +51,81 @@ export default function AbyssalWatcher() {
 
   const inputRef = useRef({ x: W / 2, y: H * 0.82, slow: false, active: false, isTouch: false });
   const TOUCH_Y_OFFSET = 70; // タッチ時、指の位置よりこの分だけ上に自機を表示（指で隠れないように）
+
+  /* ---------------- 管理者パネル（Firebase Auth） ---------------- */
+  const [adminUser, setAdminUser] = useState(null);
+  const [adminEmail, setAdminEmail] = useState('');
+  const [adminPassword, setAdminPassword] = useState('');
+  const [adminLoginError, setAdminLoginError] = useState('');
+  const [adminLoginBusy, setAdminLoginBusy] = useState(false);
+  const [adminEntries, setAdminEntries] = useState([]);
+  const [adminLoading, setAdminLoading] = useState(false);
+  const [adminDeletingId, setAdminDeletingId] = useState(null);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, u => setAdminUser(u));
+    return unsub;
+  }, []);
+
+  // 未ログインで'admin'画面に来た場合はログイン画面へ戻す（防御的なガード）
+  useEffect(() => {
+    if (screen === 'admin' && !adminUser) setScreen('adminLogin');
+  }, [screen, adminUser]);
+
+  const loadAdminEntries = useCallback(async () => {
+    setAdminLoading(true);
+    try {
+      const q = query(collection(db, 'scores'), orderBy('ts', 'desc'), limit(1000));
+      const snap = await getDocs(q);
+      setAdminEntries(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    } catch (e) {
+      setAdminEntries([]);
+    }
+    setAdminLoading(false);
+  }, []);
+
+  useEffect(() => {
+    if (screen === 'admin' && adminUser) loadAdminEntries();
+  }, [screen, adminUser, loadAdminEntries]);
+
+  async function handleAdminLogin(e) {
+    e.preventDefault();
+    setAdminLoginBusy(true);
+    setAdminLoginError('');
+    try {
+      await signInWithEmailAndPassword(auth, adminEmail.trim(), adminPassword);
+      setAdminPassword('');
+      setScreen('admin');
+    } catch (err) {
+      setAdminLoginError('ログインに失敗した：メールアドレスかパスワードを確認してください。');
+    }
+    setAdminLoginBusy(false);
+  }
+
+  async function handleAdminLogout() {
+    await signOut(auth);
+    setScreen('title');
+  }
+
+  async function handleDeleteEntry(id) {
+    if (!window.confirm('この記録を削除しますか？元に戻せません。')) return;
+    setAdminDeletingId(id);
+    try {
+      await deleteDoc(doc(db, 'scores', id));
+      setAdminEntries(entries => entries.filter(e => e.id !== id));
+    } catch (e) {
+      window.alert('削除に失敗しました：' + (e && e.message ? e.message : String(e)));
+    }
+    setAdminDeletingId(null);
+  }
+
+  /* ---------------- デバッグモード（管理者パネルからのみ起動可能） ---------------- */
+  const debugRef = useRef({ enabled: false, godMode: false, speedMul: 1 });
+  const perfRef = useRef({ lastT: 0, frames: 0 });
+  const [debugStartLevel, setDebugStartLevel] = useState(1);
+  const [debugGodMode, setDebugGodMode] = useState(false);
+  const [debugSpeed, setDebugSpeed] = useState(1);
+  const [debugStats, setDebugStats] = useState({ fps: 0, bullets: 0, lasers: 0, particles: 0 });
 
   /* ---------------- サウンド（Web Audio APIによる合成音源） ---------------- */
   const [muted, setMuted] = useState(false);
@@ -823,6 +899,14 @@ export default function AbyssalWatcher() {
   }
 
   function onPlayerHit(st) {
+    if (debugRef.current.enabled && debugRef.current.godMode) {
+      // 無敵モード：被弾演出だけ再生し、実際のダメージ処理は行わない
+      st.player.invuln = 30;
+      st.boss.shakeT = 10;
+      spawnHitParticles(st, st.player.x, st.player.y);
+      sfx.hit();
+      return;
+    }
     st.player.lives--;
     st.player.invuln = 100;
     st.boss.shakeT = 18;
@@ -1144,12 +1228,27 @@ export default function AbyssalWatcher() {
       return;
     }
 
-    st.survivalFrames++;
-    updatePlayer(st);
-    updateBoss(st);
-    updateLevel(st);
-    updateBullets(st);
-    updateParticles(st);
+    // デバッグモードの再生速度調整（無効時は常に1ステップ=通常速度のまま）
+    const dbg = debugRef.current;
+    let steps = 1;
+    if (dbg.enabled && dbg.speedMul !== 1) {
+      if (dbg.speedMul > 1) {
+        steps = Math.round(dbg.speedMul);
+      } else {
+        st._slowAccum = (st._slowAccum || 0) + dbg.speedMul;
+        steps = 0;
+        if (st._slowAccum >= 1) { st._slowAccum -= 1; steps = 1; }
+      }
+    }
+    for (let i = 0; i < steps; i++) {
+      st.survivalFrames++;
+      updatePlayer(st);
+      updateBoss(st);
+      updateLevel(st);
+      updateBullets(st);
+      updateParticles(st);
+      if (st.cleared || !st.running) break;
+    }
 
     if (centerMsgTimerRef.current > 0) {
       centerMsgTimerRef.current--;
@@ -1163,6 +1262,18 @@ export default function AbyssalWatcher() {
       setHudGraze(st.grazeCount);
     }
 
+    if (dbg.enabled) {
+      const perf = perfRef.current;
+      perf.frames++;
+      const now = performance.now();
+      if (now - perf.lastT >= 500) {
+        const fps = perf.lastT ? (perf.frames * 1000) / (now - perf.lastT) : 0;
+        perf.lastT = now;
+        perf.frames = 0;
+        setDebugStats({ fps: Math.round(fps), bullets: st.bullets.length, lasers: st.lasers.length, particles: st.particles.length });
+      }
+    }
+
     const ctx = canvasRef.current?.getContext('2d');
     if (ctx) draw(ctx, st);
 
@@ -1170,19 +1281,28 @@ export default function AbyssalWatcher() {
   }
 
   /* ---------------- ラン開始・終了 ---------------- */
-  function startRun() {
+  function startRun(startLevel, opts) {
+    // 通常プレイの起動経路では常にデバッグ状態をリセットする（管理者パネル経由のみ有効化される）
+    const debugOpts = opts && opts.debug;
+    debugRef.current = debugOpts
+      ? { enabled: true, godMode: !!debugOpts.godMode, speedMul: debugOpts.speedMul || 1 }
+      : { enabled: false, godMode: false, speedMul: 1 };
+
     const st = freshState();
+    if (startLevel && startLevel > 1) {
+      st.level = Math.min(CLEAR_LEVEL, Math.max(1, Math.floor(startLevel)));
+    }
     st.running = true;
     stateRef.current = st;
-    setHudLevel(1); setHudTime(0); setHudLives(3); setHudGraze(0);
+    setHudLevel(st.level); setHudTime(0); setHudLives(3); setHudGraze(0);
     setCenterMsg({ text: '', show: false });
     setResult(null);
     setIsClearSeq(false);
     skipHomeBgmRef.current = true; // 直後にscreenが変わってeffectのクリーンアップが走っても、BGMを止めない
     setScreen('playing');
-    triggerCenterMsg('LEVEL 1', '#c41e3a');
+    triggerCenterMsg(`LEVEL ${st.level}`, '#c41e3a');
     stopDrone();   // ホーム画面用BGMのノード参照をクリアしてから、レイド戦用BGMを新規に開始する
-    startDrone(1);
+    startDrone(st.level);
     rafRef.current = requestAnimationFrame(loop);
   }
 
@@ -1673,6 +1793,14 @@ export default function AbyssalWatcher() {
             {centerMsg.show && (
               <div style={{ ...styles.centerMsg, color: centerMsg.color }}>{centerMsg.text}</div>
             )}
+            {debugRef.current.enabled && (
+              <div style={styles.debugOverlay}>
+                DEBUG MODE<br />
+                FPS {debugStats.fps}　LV {hudLevel}<br />
+                BULLETS {debugStats.bullets}　LASERS {debugStats.lasers}　PARTICLES {debugStats.particles}<br />
+                GOD MODE: {debugRef.current.godMode ? 'ON' : 'OFF'}　SPEED: {debugRef.current.speedMul}x
+              </div>
+            )}
           </div>
         )}
 
@@ -1718,13 +1846,14 @@ export default function AbyssalWatcher() {
               </div>
             )}
             <div style={styles.mainActionRow}>
-              <button className="aw-btn gold" onClick={startRun}>挑戦を開始する</button>
+              <button className="aw-btn gold" onClick={() => startRun()}>挑戦を開始する</button>
             </div>
             <div style={styles.subActionRow}>
               <button className="aw-btn-sm" onClick={openRanking}>ランキング</button>
               <button className="aw-btn-sm" onClick={openPlayerData}>プレイヤーデータ</button>
               <button className="aw-btn-sm" onClick={() => setScreen('howto')}>操作方法</button>
             </div>
+            <span style={styles.adminLink} onClick={() => setScreen(adminUser ? 'admin' : 'adminLogin')}>admin</span>
           </div>
         )}
 
@@ -1846,7 +1975,7 @@ export default function AbyssalWatcher() {
 
             {/* 主要アクション：常に同じ位置に固定表示 */}
             <div style={{ ...styles.btnRow, marginTop: 22 }}>
-              <button className="aw-btn gold" onClick={startRun}>再挑戦する</button>
+              <button className="aw-btn gold" onClick={() => startRun()}>再挑戦する</button>
               {submitState === 'done' && <button className="aw-btn" onClick={openRanking}>ランキングを見る</button>}
               <button className="aw-btn" onClick={() => setScreen('title')}>ホームへ戻る</button>
             </div>
@@ -2108,6 +2237,135 @@ export default function AbyssalWatcher() {
             </div>
           </div>
         )}
+
+        {/* ---------------- ADMIN LOGIN ---------------- */}
+        {screen === 'adminLogin' && (
+          <div style={styles.screen}>
+            <div style={styles.eyebrow}>ADMIN</div>
+            <h1 style={{ ...styles.title, fontSize: '1.5rem' }}>管理者ログイン</h1>
+            <form onSubmit={handleAdminLogin} style={{ width: '100%', maxWidth: 280, display: 'flex', flexDirection: 'column', gap: 12, marginTop: 10 }}>
+              <input
+                className="aw-input"
+                type="email"
+                placeholder="メールアドレス"
+                value={adminEmail}
+                onChange={e => setAdminEmail(e.target.value)}
+                autoComplete="username"
+              />
+              <input
+                className="aw-input"
+                type="password"
+                placeholder="パスワード"
+                value={adminPassword}
+                onChange={e => setAdminPassword(e.target.value)}
+                autoComplete="current-password"
+              />
+              {adminLoginError && (
+                <p style={{ fontSize: 12, color: '#c41e3a', margin: 0 }}>{adminLoginError}</p>
+              )}
+              <button type="submit" className="aw-btn gold" disabled={adminLoginBusy}>
+                {adminLoginBusy ? 'ログイン中…' : 'ログイン'}
+              </button>
+            </form>
+            <button className="aw-btn" style={{ marginTop: 16 }} onClick={() => setScreen('title')}>戻る</button>
+          </div>
+        )}
+
+        {/* ---------------- ADMIN PANEL ---------------- */}
+        {screen === 'admin' && adminUser && (
+          <div style={{ ...styles.screen, justifyContent: 'flex-start', overflowY: 'auto', paddingTop: 40, paddingBottom: 60 }}>
+            <div style={styles.eyebrow}>ADMIN PANEL</div>
+            <h1 style={{ ...styles.title, fontSize: '1.5rem' }}>管理者パネル</h1>
+            <p style={{ fontSize: 12, color: '#6a6780', marginBottom: 16 }}>{adminUser.email}</p>
+
+            {(() => {
+              const stats = computeGlobalStats(adminEntries);
+              return stats ? (
+                <div style={styles.statRow}>
+                  <div style={styles.stat}><span style={styles.statNum}>{stats.totalChallengers}</span><span style={styles.statLbl}>総記録数</span></div>
+                  <div style={styles.stat}><span style={styles.statNum}>{stats.clearCount}</span><span style={styles.statLbl}>クリア数</span></div>
+                  <div style={styles.stat}><span style={styles.statNum}>{stats.clearRate.toFixed(1)}%</span><span style={styles.statLbl}>クリア率</span></div>
+                </div>
+              ) : (
+                <p style={{ fontSize: 12, color: '#6a6780', marginBottom: 12 }}>{adminLoading ? '読み込み中…' : 'データがありません'}</p>
+              );
+            })()}
+
+            {/* デバッグプレイ */}
+            <div style={{ ...styles.resultBlock, width: '100%', maxWidth: 400, marginTop: 8, marginBottom: 20 }}>
+              <div style={styles.resultBlockLabel}>デバッグプレイ</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 10 }}>
+                <label style={{ fontSize: 12, color: '#a8a5b8' }}>
+                  開始レベル：{debugStartLevel}
+                  <input
+                    type="range" min={1} max={CLEAR_LEVEL} value={debugStartLevel}
+                    onChange={e => setDebugStartLevel(Number(e.target.value))}
+                    style={{ width: '100%', marginTop: 4 }}
+                  />
+                </label>
+                <label style={{ fontSize: 12, color: '#a8a5b8', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <input type="checkbox" checked={debugGodMode} onChange={e => setDebugGodMode(e.target.checked)} />
+                  無敵モード
+                </label>
+                <label style={{ fontSize: 12, color: '#a8a5b8' }}>
+                  ゲーム速度：{debugSpeed}x
+                  <select
+                    value={debugSpeed}
+                    onChange={e => setDebugSpeed(Number(e.target.value))}
+                    style={{ width: '100%', marginTop: 4, background: '#1a1822', color: '#e8e6f0', border: '1px solid rgba(255,255,255,0.15)', padding: '6px 8px' }}
+                  >
+                    <option value={0.25}>0.25x（スロー）</option>
+                    <option value={0.5}>0.5x</option>
+                    <option value={1}>1x（通常）</option>
+                    <option value={2}>2x</option>
+                    <option value={4}>4x（高速）</option>
+                  </select>
+                </label>
+                <button
+                  className="aw-btn gold"
+                  onClick={() => startRun(debugStartLevel, { debug: { godMode: debugGodMode, speedMul: debugSpeed } })}
+                >
+                  この設定でプレイ開始
+                </button>
+              </div>
+            </div>
+
+            {/* 全記録一覧 */}
+            <div style={{ width: '100%', maxWidth: 500 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <div style={styles.pdSectionTitle}>全記録一覧（{adminEntries.length}件）</div>
+                <button className="aw-btn-sm" onClick={loadAdminEntries} disabled={adminLoading}>
+                  {adminLoading ? '更新中…' : '更新'}
+                </button>
+              </div>
+              <div style={styles.rankListWrap}>
+                <div style={styles.rankList}>
+                  {adminEntries.map(e => (
+                    <div key={e.id} style={{ ...styles.rankRow, ...(e.cleared ? styles.rankRowCleared : {}), gridTemplateColumns: '1fr 46px 56px 44px 60px' }}>
+                      <span style={styles.rankName}>{e.name}</span>
+                      <span style={styles.rankLevel}>Lv.{e.level}</span>
+                      <span style={styles.rankTime}>{Number(e.time).toFixed(1)}s</span>
+                      <span style={{ fontSize: 10, color: '#6a6780' }}>gz{e.graze}</span>
+                      <button
+                        className="aw-btn-sm"
+                        style={{ color: '#c41e3a' }}
+                        disabled={adminDeletingId === e.id}
+                        onClick={() => handleDeleteEntry(e.id)}
+                      >
+                        {adminDeletingId === e.id ? '…' : '削除'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div style={{ ...styles.btnRow, marginTop: 24 }}>
+              <button className="aw-btn" onClick={handleAdminLogout}>ログアウト</button>
+              <button className="aw-btn gold" onClick={() => setScreen('title')}>タイトルへ</button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -2161,6 +2419,15 @@ const styles = {
   },
   volumeSlider: { width: 90, accentColor: '#d4af37' },
   volumeValue: { fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: '#a8a5b8', width: 24, textAlign: 'right' },
+  adminLink: {
+    position: 'absolute', bottom: 8, right: 12, fontSize: 10, color: '#6a6780', opacity: 0.35,
+    letterSpacing: '0.05em', cursor: 'pointer', fontFamily: "'JetBrains Mono', monospace"
+  },
+  debugOverlay: {
+    position: 'absolute', top: 60, left: 10, fontFamily: "'JetBrains Mono', monospace", fontSize: 10,
+    lineHeight: 1.6, color: '#00fff2', background: 'rgba(0,0,0,0.55)', border: '1px solid rgba(0,255,242,0.35)',
+    padding: '6px 10px', pointerEvents: 'none', zIndex: 25, whiteSpace: 'nowrap'
+  },
   screen: {
     position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
     background: 'radial-gradient(ellipse at 50% 40%, rgba(20,10,25,0.97), rgba(5,3,8,0.99))', textAlign: 'center', padding: 20, zIndex: 20
